@@ -15,6 +15,7 @@ import { getWidgetIcon } from '../../utils/widgetIconMap';
 import { findTabForView, themeFromVars, typedSettings } from '../../utils/webComponentHost';
 import { findWebComponent, getWebComponentSocket, useWebComponentCatalog } from '../../utils/webComponentRegistry';
 import type { WidgetProps } from '../../types';
+import { useWebComponentValue } from '../../hooks/useWebComponentValue';
 import { HeaderGroup, HeaderSlotsInline, HeaderSlotsRow2, TitleRow } from '../layout/HeaderSlotsContext';
 
 const FILL = { display: 'block', width: '100%', height: '100%' } as const;
@@ -35,6 +36,7 @@ export function WebComponentWidget({ config, editMode }: WidgetProps) {
     const showIcon = opts.showIcon === true;
     const iconSize = (opts.iconSize as number) || 20;
     const titleAlign = (opts.titleAlign as string) ?? 'left';
+    const valueDp = typeof opts.wcValueDp === 'string' ? opts.wcValueDp : '';
     const WidgetIcon = getWidgetIcon(opts.icon as string | undefined, Puzzle);
 
     const { components, loading } = useWebComponentCatalog();
@@ -131,6 +133,9 @@ export function WebComponentWidget({ config, editMode }: WidgetProps) {
         el.addEventListener(NAVIGATE_EVENT, onNavigate);
         return () => el.removeEventListener(NAVIGATE_EVENT, onNavigate);
     }, [status, editMode]);
+
+    // value: bound to a datapoint (wcValueDp) - state -> element.value, iob-change -> state
+    useWebComponentValue(elRef, status === 'ready', valueDp, editMode);
 
     let body: React.ReactNode;
     if (status === 'ready' && component) {
