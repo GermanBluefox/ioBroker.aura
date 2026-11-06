@@ -5,6 +5,7 @@ import { version as appVersion } from '../../package.json';
 import { splitDpRef, resolveDpValue } from '../utils/dpRef';
 import { NS } from '../utils/namespace';
 import { BEHIND_WEB_EXTENSION } from '../utils/basePath';
+import { idPatternToRegExp, isIdPattern } from '../utils/idPattern';
 
 interface IoBrokerSocket {
     connected: boolean;
@@ -623,6 +624,7 @@ function createSocket(url: string): IoBrokerSocket {
             maintained.add(id);
         });
         revalidateStates(s);
+        resubscribeObjects(s);
     };
 
     s.on('connect', () => handleConnected(false));
@@ -668,6 +670,7 @@ function createSocket(url: string): IoBrokerSocket {
             }
         }
     });
+    s.on('objectChange', (...args: unknown[]) => handleObjectChange(args[0], args[1]));
 
     return s;
 }
@@ -905,13 +908,128 @@ export function getObjectDirect(id: string, opts?: { skipCache?: boolean }): Pro
     }
     const p = new Promise<ioBrokerObject | null>((resolve) => {
         getSocket().emit('getObject', id, (_err: unknown, obj: ioBrokerObject | null) => {
-            objectCache.set(id, obj ?? null);
-            objectInflight.delete(id);
+            // An objectChange (or a write) dropped this read meanwhile: its answer may
+            // predate the change, so it must not land in the cache.
+            if (objectInflight.get(id) === p) {
+                objectCache.set(id, obj ?? null);
+                objectInflight.delete(id);
+            }
             resolve(obj ?? null);
         });
     });
     objectInflight.set(id, p);
     return p;
+}
+
+// ── Object subscriptions (non-hook) ───────────────────────────────────────────
+// `objectChange` events for one object or for every object of a pattern
+// (`system.adapter.*`). Ref-counted per ID / pattern like the states: the server
+// hears `subscribeObjects` for the first subscriber and `unsubscribeObjects` after
+// the last one, and every subscription is renewed after a reconnect. A change also
+// renews the object cache, so getObjectDirect never answers with the object as it
+// was before a change that arrived.
+
+/** Gets the new object, or null when it was deleted, and the object's own ID - also for a pattern */
+export type ObjectChangeHandler = (obj: ioBrokerObject | null, id: string) => void;
+
+const objectSubscribers = new Map<string, Set<ObjectChangeHandler>>();
+// The keys of objectSubscribers that are patterns, with their regex.
+const objectPatterns = new Map<string, RegExp>();
+// IDs / patterns whose (un)subscribe the server refused - reported once.
+const objectSubscribeRefused = new Set<string>();
+
+function emitObjectSubscription(
+    s: IoBrokerSocket,
+    command: 'subscribeObjects' | 'unsubscribeObjects',
+    id: string,
+): void {
+    // With a callback the server answers a missing right to it (`permissionError`,
+    // e.g. a user without read access to objects) instead of with an event: the
+    // subscriber then hears of no change, and nothing throws.
+    s.emit(command, id, (err: unknown) => {
+        if (!err || objectSubscribeRefused.has(id)) return;
+        objectSubscribeRefused.add(id);
+        console.warn(`[useIoBroker] ${command} ${id} refused:`, err);
+    });
+}
+
+function deliverObject(fn: ObjectChangeHandler, obj: ioBrokerObject | null, id: string): void {
+    // A subscriber is foreign code (a web component) - one that throws must not
+    // keep the change from the others.
+    try {
+        fn(obj, id);
+    } catch (e) {
+        console.error(`[useIoBroker] object subscriber of ${id} failed:`, e);
+    }
+}
+
+function handleObjectChange(id: unknown, obj: unknown): void {
+    if (typeof id !== 'string' || !id) return;
+    const next = obj && typeof obj === 'object' ? (obj as ioBrokerObject) : null;
+    // Keep a cached object current, and drop a read in flight - it may answer with
+    // the object as it was before.
+    const cached = objectCache.has(id);
+    invalidateObjectCache(id);
+    if (cached) objectCache.set(id, next);
+    objectSubscribers.get(id)?.forEach((fn) => deliverObject(fn, next, id));
+    for (const [pattern, regex] of objectPatterns) {
+        if (regex.test(id)) objectSubscribers.get(pattern)?.forEach((fn) => deliverObject(fn, next, id));
+    }
+}
+
+/** After a (re)connect: subscribe again on the new connection, and tell the
+ *  subscribers of single objects what changed while nobody could tell them. */
+function resubscribeObjects(s: IoBrokerSocket): void {
+    for (const id of objectSubscribers.keys()) {
+        emitObjectSubscription(s, 'subscribeObjects', id);
+        if (objectPatterns.has(id)) continue;
+        const before = objectCache.get(id);
+        void getObjectDirect(id, { skipCache: true }).then((obj) => {
+            if (before === undefined || JSON.stringify(before) === JSON.stringify(obj)) return;
+            objectSubscribers.get(id)?.forEach((fn) => deliverObject(fn, obj, id));
+        });
+    }
+}
+
+/**
+ * Subscribe to the changes of an object - or of every object a pattern like
+ * `system.adapter.*` matches - without a React hook. Delivers changes only, not
+ * the object as it is now: read that with getObjectDirect (the first subscription
+ * of an ID drops its cached object, so that read is fresh). A user without read
+ * access to objects gets no changes, and no error either.
+ *
+ * @param id an object ID or a pattern
+ * @param callback gets the new object (null when deleted) and its ID
+ * @returns the unsubscribe function
+ */
+export function subscribeObjectDirect(id: string, callback: ObjectChangeHandler): () => void {
+    if (!isValidStateId(id)) {
+        if (import.meta.env.DEV) console.warn('[useIoBroker] refused subscribeObjectDirect with invalid ID:', id);
+        return () => {};
+    }
+    let subs = objectSubscribers.get(id);
+    if (!subs) {
+        subs = new Set();
+        objectSubscribers.set(id, subs);
+        if (isIdPattern(id)) objectPatterns.set(id, idPatternToRegExp(id));
+        // Nothing kept the cached object current while nobody was subscribed.
+        else invalidateObjectCache(id);
+        emitObjectSubscription(getSocket(), 'subscribeObjects', id);
+    }
+    subs.add(callback);
+    return () => {
+        const set = objectSubscribers.get(id);
+        if (!set?.delete(callback) || set.size) return;
+        objectSubscribers.delete(id);
+        objectPatterns.delete(id);
+        emitObjectSubscription(getSocket(), 'unsubscribeObjects', id);
+    };
+}
+
+/** DEV-only: play an inbound `objectChange` - an object changed (`obj`) or deleted
+ *  (`null`) - without a socket, for the harness and tests. */
+export function __devInjectObjectChange(id: string, obj: ioBrokerObject | null): void {
+    handleObjectChange(id, obj);
 }
 
 // ── History adapter ────────────────────────────────────────────────────────────

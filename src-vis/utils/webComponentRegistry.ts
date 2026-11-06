@@ -23,6 +23,7 @@ import {
     getStateDirect,
     sendToDirect,
     setStateDirectAsync,
+    subscribeObjectDirect,
     subscribeStateDirect,
 } from '../hooks/useIoBroker';
 import { createWebComponentSocket, objectIdOfRow, type HostState } from './webComponentHost';
@@ -130,6 +131,7 @@ export function getWebComponentSocket(): Promise<WebComponentSocket> {
                             ack,
                         ),
                     getObject: (id) => getObjectDirect(id),
+                    subscribeObject: (id, cb) => subscribeObjectDirect(id, cb),
                     getHistory: (id, options) =>
                         new Promise((resolve, reject) => {
                             getSocket().emit('getHistory', id, options, (err: unknown, result: unknown) =>

@@ -156,6 +156,246 @@ function fakeApi() {
     check('socket: no object after unsubscribing', objs, []);
 }
 
+// ── object subscriptions: the bridge, then hooks/useIoBroker on a fake socket ──
+{
+    const subs = new Map(); // id or pattern -> Set(cb)
+    const log = [];
+    const f = fakeApi();
+    f.api.subscribeObject = (id, cb) => {
+        log.push(['subObj', id]);
+        if (!subs.has(id)) {
+            subs.set(id, new Set());
+        }
+        subs.get(id).add(cb);
+        return () => {
+            log.push(['unsubObj', id]);
+            subs.get(id).delete(cb);
+        };
+    };
+    const socket = m.createWebComponentSocket(f.api, 'en');
+    const objs = [];
+    const oc = (id, obj) => objs.push([id, obj === null ? null : obj?.v]);
+    await socket.subscribeObject(['flow.0.diagrams.a', 'system.adapter.*'], oc);
+    await tick();
+    check(
+        'objects: subscribed through the host, no object delivered up front',
+        [log, objs],
+        [
+            [
+                ['subObj', 'flow.0.diagrams.a'],
+                ['subObj', 'system.adapter.*'],
+            ],
+            [],
+        ],
+    );
+    for (const cb of subs.get('flow.0.diagrams.a')) {
+        cb({ v: 2 }, 'flow.0.diagrams.a');
+        cb(null, 'flow.0.diagrams.a');
+    }
+    for (const cb of subs.get('system.adapter.*')) {
+        cb({ v: 3 }, 'system.adapter.flow.0');
+    }
+    check('objects: changes, deletion as null, a pattern with the ID of the object', objs, [
+        ['flow.0.diagrams.a', 2],
+        ['flow.0.diagrams.a', null],
+        ['system.adapter.flow.0', 3],
+    ]);
+    await socket.unsubscribeObject(['flow.0.diagrams.a', 'system.adapter.*'], oc);
+    check('objects: unsubscribed through the host', log.slice(2), [
+        ['unsubObj', 'flow.0.diagrams.a'],
+        ['unsubObj', 'system.adapter.*'],
+    ]);
+}
+{
+    // the real socket layer, bundled with a fake socket library in place of /socket.io/socket.io.js
+    const ioBundle = join(cache, `aura-web-components-io-objects-${process.pid}.mjs`);
+    await build({
+        entryPoints: [join(process.cwd(), 'src-vis/hooks/useIoBroker.ts')],
+        bundle: true,
+        platform: 'node',
+        format: 'esm',
+        outfile: ioBundle,
+        define: { 'import.meta.env.DEV': 'false' },
+        logLevel: 'warning',
+    });
+    const sockets = [];
+    const answers = {}; // command -> (...args) => callback arguments
+    globalThis.window ??= { location: { origin: 'http://aura.test', protocol: 'http:' } };
+    globalThis.io = {
+        connect() {
+            const handlers = {};
+            const sock = {
+                connected: true,
+                emitted: [],
+                on(event, cb) {
+                    (handlers[event] ??= []).push(cb);
+                },
+                emit(event, ...args) {
+                    const cb = typeof args.at(-1) === 'function' ? args.pop() : null;
+                    sock.emitted.push([event, ...args]);
+                    if (cb && answers[event]) {
+                        setTimeout(() => cb(...answers[event](...args)), 0);
+                    }
+                },
+                disconnect() {},
+                fire(event, ...args) {
+                    for (const h of handlers[event] ?? []) {
+                        h(...args);
+                    }
+                },
+            };
+            sockets.push(sock);
+            return sock;
+        },
+    };
+    const quiet = console.log;
+    console.log = () => {}; // the connect banner
+    const io = await import(pathToFileURL(ioBundle).href);
+    rmSync(ioBundle, { force: true });
+    const s = io.getSocket();
+    s.fire('connect');
+    console.log = quiet;
+    const sent = (command) => s.emitted.filter((e) => e[0] === command).map((e) => e[1]);
+
+    let version = 1;
+    answers.getObject = (id) => [null, { _id: id, common: { name: `${id} v${version}` } }];
+    answers.subscribeObjects = (id) => [id.startsWith('secret.') ? 'permissionError' : null];
+    answers.unsubscribeObjects = () => [null];
+
+    const got = [];
+    const a = (obj, id) => got.push(['a', id, obj === null ? null : obj.common.name]);
+    const b = (obj, id) => got.push(['b', id, obj === null ? null : obj.common.name]);
+    const offA = io.subscribeObjectDirect('flow.0.diagrams.d1', a);
+    const offB = io.subscribeObjectDirect('flow.0.diagrams.d1', b);
+    const offP = io.subscribeObjectDirect('system.adapter.*', a);
+    check('io objects: one subscribeObjects per ID or pattern', sent('subscribeObjects'), [
+        'flow.0.diagrams.d1',
+        'system.adapter.*',
+    ]);
+    s.fire('objectChange', 'flow.0.diagrams.d1', { common: { name: 'changed' } });
+    s.fire('objectChange', 'system.adapter.flow.0', { common: { name: 'instance' } });
+    s.fire('objectChange', 'system.adapterX', { common: { name: 'no match' } });
+    s.fire('objectChange', 'flow.0.diagrams.d1', null);
+    check('io objects: exact and pattern subscribers, deletion as null', got, [
+        ['a', 'flow.0.diagrams.d1', 'changed'],
+        ['b', 'flow.0.diagrams.d1', 'changed'],
+        ['a', 'system.adapter.flow.0', 'instance'],
+        ['a', 'flow.0.diagrams.d1', null],
+        ['b', 'flow.0.diagrams.d1', null],
+    ]);
+
+    // the object cache follows the changes
+    got.length = 0;
+    const reads = () => sent('getObject').length;
+    await io.getObjectDirect('x.0.cached');
+    const before = reads();
+    s.fire('objectChange', 'x.0.cached', { common: { name: 'pushed' } });
+    check(
+        'io objects: a change renews a cached object, no read',
+        [(await io.getObjectDirect('x.0.cached')).common.name, reads() - before],
+        ['pushed', 0],
+    );
+    s.fire('objectChange', 'x.0.cached', null);
+    check('io objects: a deleted cached object reads as null', await io.getObjectDirect('x.0.cached'), null);
+    // a read in flight while the object changes: its (older) answer must not be cached
+    const inFlight = io.getObjectDirect('x.0.racing');
+    s.fire('objectChange', 'x.0.racing', { common: { name: 'newer' } });
+    await inFlight;
+    const racingReads = reads();
+    await io.getObjectDirect('x.0.racing');
+    check('io objects: a read overtaken by a change is not cached', reads() - racingReads, 1);
+    // the first subscription of an ID drops what nobody kept current
+    await io.getObjectDirect('x.0.stale');
+    const staleReads = reads();
+    const offStale = io.subscribeObjectDirect('x.0.stale', () => {});
+    await io.getObjectDirect('x.0.stale');
+    check('io objects: subscribing reads the object afresh', reads() - staleReads, 1);
+    offStale();
+
+    // a refused subscription (no read right for objects) neither throws nor repeats its warning
+    const warn = console.warn;
+    const warnings = [];
+    console.warn = (...args) => warnings.push(args.join(' '));
+    let threw = false;
+    try {
+        const off1 = io.subscribeObjectDirect('secret.0.x', a);
+        off1();
+        io.subscribeObjectDirect('secret.0.x', a)();
+        await new Promise((r) => setTimeout(r, 5));
+    } catch {
+        threw = true;
+    }
+    console.warn = warn;
+    check(
+        'io objects: a refused subscription is reported once and throws nothing',
+        [threw, warnings.filter((w) => w.includes('secret.0.x')).length],
+        [false, 1],
+    );
+
+    // a subscriber that throws does not keep the change from the others
+    got.length = 0;
+    const error = console.error;
+    console.error = () => {};
+    const offBad = io.subscribeObjectDirect('flow.0.diagrams.d1', () => {
+        throw new Error('broken component');
+    });
+    const offAfter = io.subscribeObjectDirect('flow.0.diagrams.d1', (obj, id) => got.push(['after', id]));
+    s.fire('objectChange', 'flow.0.diagrams.d1', { common: { name: 'x' } });
+    console.error = error;
+    check(
+        'io objects: a throwing subscriber leaves the others alone',
+        got.map((g) => g[0]),
+        ['a', 'b', 'after'],
+    );
+    offBad();
+    offAfter();
+
+    // reconnect: subscribed again; a single object that changed meanwhile is delivered
+    await io.getObjectDirect('flow.0.diagrams.d1'); // cached as v1
+    got.length = 0;
+    const sentBefore = s.emitted.length;
+    console.log = () => {};
+    s.fire('disconnect');
+    version = 2;
+    s.fire('reconnect');
+    console.log = quiet;
+    await new Promise((r) => setTimeout(r, 5));
+    check(
+        'io objects: every subscription renewed after a reconnect',
+        s.emitted
+            .slice(sentBefore)
+            .filter((e) => e[0] === 'subscribeObjects')
+            .map((e) => e[1]),
+        ['flow.0.diagrams.d1', 'system.adapter.*'],
+    );
+    check('io objects: what changed while offline reaches the subscribers', got, [
+        ['a', 'flow.0.diagrams.d1', 'flow.0.diagrams.d1 v2'],
+        ['b', 'flow.0.diagrams.d1', 'flow.0.diagrams.d1 v2'],
+    ]);
+
+    // unsubscribing: the server hears it after the last subscriber of an ID
+    offA();
+    check('io objects: still subscribed while a subscriber is left', sent('unsubscribeObjects'), [
+        'x.0.stale',
+        'secret.0.x',
+        'secret.0.x',
+    ]);
+    offB();
+    offP();
+    offP(); // twice: no second unsubscribe
+    check('io objects: unsubscribed after the last one', sent('unsubscribeObjects').slice(3), [
+        'flow.0.diagrams.d1',
+        'system.adapter.*',
+    ]);
+    got.length = 0;
+    io.__devInjectObjectChange('system.adapter.flow.0', { common: { name: 'late' } });
+    check('io objects: nothing after unsubscribing', got, []);
+    const offDev = io.subscribeObjectDirect('system.adapter.*', a);
+    io.__devInjectObjectChange('system.adapter.flow.0', { common: { name: 'played' } });
+    check('io objects: the dev stub plays an objectChange', got, [['a', 'system.adapter.flow.0', 'played']]);
+    offDev();
+}
+
 // ── theme ───────────────────────────────────────────────────────────────────
 {
     const vars = {

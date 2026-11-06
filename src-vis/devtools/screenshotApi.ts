@@ -19,6 +19,7 @@ import { measureRenderedWidgets } from '../utils/renderReport';
 import { readIconsOfflineFlag } from '../utils/iconifyLoader';
 import {
     __devInjectObject,
+    __devInjectObjectChange,
     __devInjectState,
     __devSetHistoryGen,
     __devSetObjectView,
@@ -439,6 +440,12 @@ function installScreenshotApi(): void {
             for (const [id, obj] of Object.entries(byId)) {
                 __devInjectObject(id, obj as Parameters<typeof __devInjectObject>[1]);
             }
+        },
+
+        /** Play an `objectChange` event: what subscribed to the object (or to a pattern
+         *  matching it, e.g. a web component's `getObjectIds`) gets it. `null` = deleted. */
+        objectChange(id: string, obj: unknown): void {
+            __devInjectObjectChange(id, (obj ?? null) as Parameters<typeof __devInjectObjectChange>[1]);
         },
 
         /** Stub getObjectView per object type: { instance: [{id,value}], script: [...] }.

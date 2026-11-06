@@ -45,6 +45,9 @@ meisten Komponenten eine eigene Überschrift haben.
 - **Dialoge** der Komponente öffnen sich als Dialog des Browsers in den Farben des Themes.
 - **Nicht installiert:** Fehlt die Komponente (Adapter entfernt), bleibt das Widget im
   Dashboard leer; im Bearbeitungsmodus steht ein Hinweis.
+- **Objekte bleiben aktuell:** Objekte, die eine Komponente beobachtet (z. B. das Diagramm des
+  Adapters `flow`), kommen bei jeder Änderung sofort an — auch nach einem Verbindungsabbruch.
+  Fehlt dem Benutzer das Leserecht für Objekte, bleibt es beim einmal gelesenen Stand.
 - **Größe:** Die Komponente füllt die ganze Widget-Fläche.
 
 ## Für Adapter-Entwickler
