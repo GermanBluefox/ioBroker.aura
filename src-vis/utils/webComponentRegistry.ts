@@ -8,6 +8,11 @@
  * answers `/adapter/…` from the file storage and `/lib/esm/react-*.js` itself, and
  * behind the web adapter extension (`/aura/`) web serves both, so
  * `getWebComponentSources(…, document.baseURI)` finds them either way.
+ *
+ * While anything shows the catalog, it follows the instance objects: an adapter
+ * with components installed, updated or removed shows up without a reload. The
+ * URLs carry the adapter version, so the next page load fetches updated files
+ * instead of cached ones.
  */
 import { useCallback, useEffect, useState } from 'react';
 import {
@@ -17,34 +22,127 @@ import {
     type WebComponentSocket,
 } from '@iobroker/web-components';
 import {
+    getDisconnectedSince,
     getObjectDirect,
     getObjectViewDirect,
     getSocket,
     getStateDirect,
+    onDisconnectedSinceChange,
     sendToDirect,
     setStateDirectAsync,
     subscribeObjectDirect,
     subscribeStateDirect,
+    whenStateReadsIdle,
 } from '../hooks/useIoBroker';
-import { createWebComponentSocket, objectIdOfRow, type HostState } from './webComponentHost';
+import {
+    createCatalogWatch,
+    createWebComponentSocket,
+    mergeCatalog,
+    objectIdOfRow,
+    versionedModule,
+    versionedSources,
+    type HostState,
+} from './webComponentHost';
 
 let catalog: Promise<LoadedWebComponent[]> | null = null;
 const catalogListeners = new Set<() => void>();
+// What the last read gave - a read again is merged into it (mergeCatalog).
+let catalogLoaded: LoadedWebComponent[] = [];
+const catalogWatch = createCatalogWatch();
+
+type InstanceObject = { _id: string; common?: { version?: string; webComponents?: unknown } };
+
+async function readInstances(): Promise<InstanceObject[]> {
+    const view = await getObjectViewDirect('instance', 'system.adapter.', 'system.adapter.\u9999');
+    return (view.rows ?? [])
+        .map((row) => row.value as unknown as InstanceObject)
+        .filter((obj) => obj && typeof obj._id === 'string');
+}
 
 async function readCatalog(): Promise<LoadedWebComponent[]> {
-    const view = await getObjectViewDirect('instance', 'system.adapter.', 'system.adapter.\u9999');
-    const instances = (view.rows ?? [])
-        .map((row) => row.value as unknown as { _id: string; common?: { version?: string; webComponents?: unknown } })
-        .filter((obj) => obj && Array.isArray(obj.common?.webComponents) && obj.common.webComponents.length)
+    const all = await readInstances();
+    catalogWatch.reset(all);
+    const instances = all
+        .filter((obj) => Array.isArray(obj.common?.webComponents) && obj.common.webComponents.length)
         .map((obj) => ({ _id: obj._id, common: obj.common ?? {} }));
-    if (!instances.length) return [];
-    return loadWebComponents(getWebComponentSources(instances, document.baseURI), { log: console });
+    const loaded = instances.length
+        ? await loadWebComponents(versionedSources(getWebComponentSources(instances, document.baseURI)), {
+              log: console,
+          })
+        : [];
+    catalogLoaded = mergeCatalog(loaded.map(versionedModule), catalogLoaded, (tag) => !!customElements.get(tag));
+    return catalogLoaded;
+}
+
+// ── keeping the catalog current ──────────────────────────────────────────────
+// Installing, updating or removing an adapter rewrites its instance objects. While
+// anything uses the catalog (a widget, the add dialog, the settings), their changes
+// are watched; a burst of them (an update rewrites every instance) is read once,
+// when it is over - and only if the set of (adapter, version, components) changed.
+const RELOAD_DELAY_MS = 2000;
+// Switching tabs unmounts and mounts the widgets: no unsubscribe/subscribe for that.
+const UNWATCH_DELAY_MS = 10000;
+let catalogUsers = 0;
+let stopWatching: (() => void) | null = null;
+let unwatchTimer: ReturnType<typeof setTimeout> | undefined;
+let reloadTimer: ReturnType<typeof setTimeout> | undefined;
+
+function scheduleCatalogReload(): void {
+    clearTimeout(reloadTimer);
+    reloadTimer = setTimeout(() => {
+        reloadTimer = undefined;
+        void loadWebComponentCatalog(true);
+    }, RELOAD_DELAY_MS);
+}
+
+/** For a time no change could arrive in (unwatched, offline): read the instance
+ *  objects once, and the catalog only if they changed it. */
+function recheckCatalog(): void {
+    if (!catalog) return; // not read yet - the first read is current anyway
+    void whenStateReadsIdle()
+        .then(readInstances)
+        .then((all) => {
+            if (catalogWatch.differs(all)) scheduleCatalogReload();
+        })
+        .catch(() => undefined);
 }
 
 /**
- * The components of all installed adapters, read once per page and shared.
+ * Keep the catalog current while it is in use; returns the function that ends this
+ * use. Called by useWebComponentCatalog - exported for the tests.
+ */
+export function watchCatalog(): () => void {
+    catalogUsers++;
+    clearTimeout(unwatchTimer);
+    if (!stopWatching) {
+        const offObjects = subscribeObjectDirect('system.adapter.*', (obj, id) => {
+            if (catalogWatch.change(id, obj)) scheduleCatalogReload();
+        });
+        // A pattern's changes during an outage are lost - look once it is over.
+        const offConnection = onDisconnectedSinceChange(() => {
+            if (getDisconnectedSince() === null) recheckCatalog();
+        });
+        stopWatching = () => {
+            offObjects();
+            offConnection();
+        };
+        recheckCatalog();
+    }
+    return () => {
+        if (--catalogUsers > 0) return;
+        unwatchTimer = setTimeout(() => {
+            stopWatching?.();
+            stopWatching = null;
+        }, UNWATCH_DELAY_MS);
+    };
+}
+
+/**
+ * The components of all installed adapters, read once per page and shared, and
+ * read again when an adapter with components is installed, updated or removed
+ * (while `useWebComponentCatalog` is mounted).
  *
- * @param force read again (after an adapter was installed or updated)
+ * @param force read again
  */
 export function loadWebComponentCatalog(force = false): Promise<LoadedWebComponent[]> {
     if (!catalog || force) {
@@ -69,7 +167,8 @@ export function findWebComponent(
     return withTag.find((c) => c.adapter === adapter) ?? withTag[0];
 }
 
-/** React access to the catalog: `components` stays empty until it is read */
+/** React access to the catalog: `components` stays empty until it is read, and
+ *  keeps the components it has while the catalog is read again. */
 export function useWebComponentCatalog(): {
     components: LoadedWebComponent[];
     loading: boolean;
@@ -82,14 +181,15 @@ export function useWebComponentCatalog(): {
     useEffect(() => {
         const bump = (): void => setEpoch((n) => n + 1);
         catalogListeners.add(bump);
+        const unwatch = watchCatalog();
         return () => {
             catalogListeners.delete(bump);
+            unwatch();
         };
     }, []);
 
     useEffect(() => {
         let alive = true;
-        setLoading(true);
         void loadWebComponentCatalog().then((list) => {
             if (!alive) return;
             setComponents(list);

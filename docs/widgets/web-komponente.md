@@ -17,10 +17,16 @@ Suche findet sie auch über den Adapter-Namen (`flow`) oder „Web-Komponente“
 bekommt die Größe, die die Komponente für sich angibt.
 
 Angeboten wird, was ein Adapter in seiner `io-package.json` unter `common.webComponents`
-anmeldet. Ist kein solcher Adapter installiert, gibt es keine solchen Einträge. Nach der
-Installation oder einem Update eines Adapters die Seite neu laden — oder in den Einstellungen
-eines Komponenten-Widgets mit **↻** neben der Auswahl **Komponente** neu einlesen. Dort lässt sich
-auch auf eine andere Komponente umstellen.
+anmeldet. Ist kein solcher Adapter installiert, gibt es keine solchen Einträge. Wird ein
+Adapter mit Komponenten installiert, aktualisiert oder entfernt, liest Aura die Liste nach
+wenigen Sekunden von selbst neu ein — ohne die Seite neu zu laden. Von Hand geht das in den
+Einstellungen eines Komponenten-Widgets mit **↻** neben der Auswahl **Komponente**; dort lässt
+sich auch auf eine andere Komponente umstellen.
+
+Eine **aktualisierte** Komponente, die bereits auf der Seite zu sehen ist, läuft bis zum
+nächsten Neuladen der Seite in der alten Version weiter — ein Browser kann ein Element nicht
+neu definieren. Danach lädt er die neue Version: Aura hängt die Adapterversion an die
+Adressen von Manifest und Modul, damit keine alte Datei aus dem Browser-Cache kommt.
 
 ## Einstellungen
 

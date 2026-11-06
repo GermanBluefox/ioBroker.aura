@@ -27,3 +27,4 @@
 - feat: js-controller 8 - Aura's port and listen address show up in the host's used resources, and a port already held by another instance is named in the log
 - fix: Web adapter extension - together with another web extension that handles its own WebSockets (e.g. victron-cerbo), every socket connection of the web instance was closed right after connecting ("ws connection error: CLOSE_ABNORMAL", endless reconnects); Aura now leaves the web instance's WebSocket listeners untouched
 - fix: Web components - changes to the objects a component watches (e.g. a flow diagram edited elsewhere) now reach it at once, without reloading the page
+- feat: Web components - an adapter with web components that is installed, updated or removed shows up in the widget list without reloading the page; after an update the browser loads the new version instead of a cached one

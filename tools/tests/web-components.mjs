@@ -585,6 +585,324 @@ check('navigate: no view', m.findTabForView(undefined, layouts, 'L1'), null);
     );
 }
 
+// ── a catalog that stays current: versioned URLs, merging, change detection ──
+{
+    check(
+        'version: the adapter version as query of a URL',
+        [
+            m.versionedUrl('http://h/adapter/flow/wc/d.json', '1.2.0'),
+            m.versionedUrl('http://h/adapter/flow/wc/d.js?v=1.1.0&x=1', '1.2.0'),
+            m.versionedUrl('http://h/adapter/flow/wc/d.js', ''),
+            m.versionedUrl('not a url', '1.0.0'),
+        ],
+        [
+            'http://h/adapter/flow/wc/d.json?v=1.2.0',
+            'http://h/adapter/flow/wc/d.js?v=1.2.0&x=1',
+            'http://h/adapter/flow/wc/d.js',
+            'not a url',
+        ],
+    );
+
+    // the real loader of the package: the versioned manifest URL is read, the module URL
+    // (relative to the manifest, so without its query) gets the version as well
+    const pkg = await import('@iobroker/web-components');
+    const manifestOf = (tag, module) => ({
+        manifestVersion: 1,
+        tag,
+        name: 'D',
+        module,
+        icon: 'd.svg',
+        settings: { type: 'panel', items: {} },
+    });
+    const read = [];
+    const sources = m.versionedSources(
+        pkg.getWebComponentSources(
+            [{ _id: 'system.adapter.flow.0', common: { version: '1.2.0', webComponents: ['wc/d.json'] } }],
+            'http://h:8095/index.html',
+        ),
+    );
+    const loaded = (
+        await pkg.loadWebComponents(sources, {
+            readManifest: async (url) => {
+                read.push(url);
+                return manifestOf('iob-versioned-d', 'd.js');
+            },
+            log: { error() {}, warn() {} },
+        })
+    ).map(m.versionedModule);
+    check('version: the manifest is read under its versioned URL', read, [
+        'http://h:8095/adapter/flow/wc/d.json?v=1.2.0',
+    ]);
+    check(
+        'version: the module URL is versioned too',
+        loaded[0].moduleUrl,
+        'http://h:8095/adapter/flow/wc/d.js?v=1.2.0',
+    );
+    check(
+        'version: the icon still resolves next to the manifest',
+        m.webComponentPickerEntries(loaded, 'en')[0].iconUrl,
+        'http://h:8095/adapter/flow/wc/d.svg',
+    );
+    // importWebComponent: once per URL, and the tag check still holds
+    const defined = new Set();
+    globalThis.customElements ??= { get: (tag) => (defined.has(tag) ? class {} : undefined) };
+    const imported = [];
+    const importer = async (url) => {
+        imported.push(url);
+        defined.add('iob-versioned-d');
+        return {};
+    };
+    await pkg.importWebComponent(loaded[0], { importer });
+    await pkg.importWebComponent(loaded[0], { importer });
+    check('version: the versioned module is imported once', imported, ['http://h:8095/adapter/flow/wc/d.js?v=1.2.0']);
+    let rejected = '';
+    await pkg
+        .importWebComponent(
+            {
+                ...loaded[0],
+                moduleUrl: 'http://h:8095/adapter/flow/wc/other.js?v=1.2.0',
+                manifest: manifestOf('iob-x-none', 'other.js'),
+            },
+            { importer: async () => ({}) },
+        )
+        .catch((e) => (rejected = e.message));
+    check(
+        'version: a module that does not define its tag is still refused',
+        /does not define <iob-x-none>/.test(rejected),
+        true,
+    );
+    // an older component: a module exporting its manifest, imported at once under the versioned URL
+    const legacyImports = [];
+    const legacy = (
+        await pkg.loadWebComponents(
+            m.versionedSources([{ url: 'http://h:8095/adapter/old/wc/old.js', adapter: 'old', version: '0.2.0' }]),
+            {
+                importer: async (url) => {
+                    legacyImports.push(url);
+                    defined.add('iob-legacy-old');
+                    return { manifest: manifestOf('iob-legacy-old', undefined) };
+                },
+                log: { error() {}, warn() {} },
+            },
+        )
+    ).map(m.versionedModule);
+    check(
+        'version: a module that exports its manifest keeps one versioned URL',
+        [legacyImports, legacy[0].moduleUrl],
+        [['http://h:8095/adapter/old/wc/old.js?v=0.2.0'], 'http://h:8095/adapter/old/wc/old.js?v=0.2.0'],
+    );
+
+    // merging a catalog read again
+    const comp = (adapter, tag, version, extra = {}) => ({
+        url: `http://h/adapter/${adapter}/${tag}.json?v=${version}`,
+        adapter,
+        version,
+        moduleUrl: `http://h/adapter/${adapter}/${tag}.js?v=${version}`,
+        manifest: { ...manifestOf(tag, `${tag}.js`), ...extra },
+    });
+    const before = [comp('flow', 'iob-a', '1.0.0'), comp('flow', 'iob-b', '1.0.0'), comp('x', 'iob-c', '2.0.0')];
+    const after = [
+        comp('flow', 'iob-a', '1.1.0'), // updated, its element is defined
+        comp('flow', 'iob-b', '1.1.0'), // updated, never shown
+        comp('x', 'iob-c', '2.0.0'), // unchanged
+        comp('y', 'iob-d', '1.0.0'), // new
+    ];
+    const merged = m.mergeCatalog(after, before, (tag) => tag === 'iob-a');
+    check(
+        'merge: a defined element keeps the module it was imported from, the rest takes the new one',
+        merged.map((c) => c.moduleUrl.replace('http://h/adapter/', '')),
+        ['flow/iob-a.js?v=1.0.0', 'flow/iob-b.js?v=1.1.0', 'x/iob-c.js?v=2.0.0', 'y/iob-d.js?v=1.0.0'],
+    );
+    check('merge: the new manifest is taken all the same', merged[0].url, after[0].url);
+    check(
+        'merge: an unchanged component stays the same object, a changed one does not',
+        [merged[2] === before[2], merged[0] === before[0], merged[3] === after[3]],
+        [true, false, true],
+    );
+    const changedSettings = m.mergeCatalog([comp('x', 'iob-c', '2.0.0', { name: 'New name' })], before, () => true);
+    check('merge: a changed manifest of the same version is a new object', changedSettings[0] === before[2], false);
+
+    // which instance changes make the catalog be read again
+    const inst = (id, version, list, extra = {}) => ({
+        _id: id,
+        type: 'instance',
+        common: { version, ...(list ? { webComponents: list } : {}), ...extra },
+    });
+    const watch = m.createCatalogWatch();
+    watch.reset([
+        inst('system.adapter.flow.0', '1.0.0', ['wc/a.json']),
+        inst('system.adapter.admin.0', '7.0.0'),
+        { _id: 'system.adapter.broken.0' },
+        null,
+    ]);
+    const changes = [
+        ['an object below an instance', 'system.adapter.flow.0.alive', { common: {} }],
+        ['the adapter object', 'system.adapter.flow', inst('system.adapter.flow', '1.1.0', ['wc/a.json'])],
+        [
+            'an instance started or configured',
+            'system.adapter.flow.0',
+            inst('system.adapter.flow.0', '1.0.0', ['wc/a.json'], { enabled: false }),
+        ],
+        ['a second instance', 'system.adapter.flow.1', inst('system.adapter.flow.1', '1.0.0', ['wc/a.json'])],
+        ['an adapter without components', 'system.adapter.admin.0', inst('system.adapter.admin.0', '7.1.0')],
+        ['the update of flow.0', 'system.adapter.flow.0', inst('system.adapter.flow.0', '1.1.0', ['wc/a.json'])],
+        ['the update of flow.1', 'system.adapter.flow.1', inst('system.adapter.flow.1', '1.1.0', ['wc/a.json'])],
+        ['the second instance removed', 'system.adapter.flow.1', null],
+        [
+            'a new component',
+            'system.adapter.flow.0',
+            inst('system.adapter.flow.0', '1.1.0', ['wc/a.json', 'wc/b.json']),
+        ],
+        ['a new adapter with components', 'system.adapter.y.0', inst('system.adapter.y.0', '1.0.0', ['d.json'])],
+        ['the adapter removed', 'system.adapter.y.0', null],
+    ];
+    check(
+        'watch: read again only when (adapter, version, components) change',
+        changes.map(([what, id, obj]) => `${what}: ${watch.change(id, obj)}`),
+        [
+            'an object below an instance: false',
+            'the adapter object: false',
+            'an instance started or configured: false',
+            'a second instance: false',
+            'an adapter without components: false',
+            'the update of flow.0: true',
+            'the update of flow.1: true', // the same burst - the reload is debounced, so it is read once
+            'the second instance removed: false',
+            'a new component: true',
+            'a new adapter with components: true',
+            'the adapter removed: true',
+        ],
+    );
+    check(
+        'watch: instances read anew after an outage - the same set or another one',
+        [
+            watch.differs([inst('system.adapter.flow.0', '1.1.0', ['wc/a.json', 'wc/b.json'])]),
+            watch.differs([inst('system.adapter.flow.0', '1.2.0', ['wc/a.json', 'wc/b.json'])]),
+        ],
+        [false, true],
+    );
+}
+{
+    // the catalog of utils/webComponentRegistry on the real socket layer and a fake socket library
+    const regBundle = join(cache, `aura-web-components-registry-${process.pid}.mjs`);
+    await build({
+        entryPoints: [join(process.cwd(), 'src-vis/utils/webComponentRegistry.ts')],
+        bundle: true,
+        platform: 'node',
+        format: 'esm',
+        outfile: regBundle,
+        define: { 'import.meta.env.DEV': 'false' },
+        logLevel: 'warning',
+    });
+    let flowVersion = '1.0.0';
+    const instanceRows = () => [
+        {
+            id: 'system.adapter.flow.0',
+            value: {
+                _id: 'system.adapter.flow.0',
+                type: 'instance',
+                common: { version: flowVersion, webComponents: ['wc/d.json'] },
+            },
+        },
+        { id: 'system.adapter.admin.0', value: { _id: 'system.adapter.admin.0', common: { version: '7.0.0' } } },
+    ];
+    const sockets = [];
+    globalThis.window ??= { location: { origin: 'http://aura.test', protocol: 'http:' } };
+    globalThis.customElements ??= { get: () => undefined };
+    globalThis.io = {
+        connect() {
+            const handlers = {};
+            const sock = {
+                connected: true,
+                emitted: [],
+                on(event, cb) {
+                    (handlers[event] ??= []).push(cb);
+                },
+                emit(event, ...args) {
+                    const cb = typeof args.at(-1) === 'function' ? args.pop() : null;
+                    sock.emitted.push([event, ...args]);
+                    if (!cb) return;
+                    if (event === 'getObjectView') setTimeout(() => cb(null, { rows: instanceRows() }), 0);
+                    else setTimeout(() => cb(null), 0);
+                },
+                disconnect() {},
+                fire(event, ...args) {
+                    for (const h of handlers[event] ?? []) {
+                        h(...args);
+                    }
+                },
+            };
+            sockets.push(sock);
+            return sock;
+        },
+    };
+    const fetched = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+        fetched.push(String(url));
+        return {
+            ok: true,
+            json: async () => ({
+                manifestVersion: 1,
+                tag: 'iob-registry-d',
+                name: 'D',
+                module: 'd.js',
+                settings: { type: 'panel', items: {} },
+            }),
+        };
+    };
+    const quiet = console.log;
+    console.log = () => {};
+    const reg = await import(pathToFileURL(regBundle).href);
+    rmSync(regBundle, { force: true });
+    // after the import: with a document, the socket layer would start its wake-up timers
+    globalThis.document = { baseURI: 'http://h:8095/' };
+    const first = await reg.loadWebComponentCatalog();
+    const s = sockets[0];
+    s.fire('connect');
+    console.log = quiet;
+    check(
+        'catalog: manifest and module under versioned URLs',
+        [fetched, first[0]?.moduleUrl],
+        [['http://h:8095/adapter/flow/wc/d.json?v=1.0.0'], 'http://h:8095/adapter/flow/wc/d.js?v=1.0.0'],
+    );
+    const objectSubs = () => s.emitted.filter((e) => e[0] === 'subscribeObjects').map((e) => e[1]);
+    check('catalog: nobody uses it - no object subscription', objectSubs(), []);
+    const stop = reg.watchCatalog();
+    const stop2 = reg.watchCatalog();
+    check('catalog: in use - the instance objects are watched, once', objectSubs(), ['system.adapter.*']);
+    await new Promise((r) => setTimeout(r, 150)); // the look at what changed before the watch: nothing
+    fetched.length = 0;
+    // an instance that starts, an object below it: nothing to read
+    s.fire('objectChange', 'system.adapter.flow.0', {
+        _id: 'system.adapter.flow.0',
+        common: { version: '1.0.0', webComponents: ['wc/d.json'], enabled: true },
+    });
+    s.fire('objectChange', 'system.adapter.flow.0.alive', { common: {} });
+    // the update: written twice in a burst, read once after it
+    flowVersion = '1.1.0';
+    const updated = { _id: 'system.adapter.flow.0', common: { version: '1.1.0', webComponents: ['wc/d.json'] } };
+    s.fire('objectChange', 'system.adapter.flow.0', updated);
+    s.fire('objectChange', 'system.adapter.flow', { common: { version: '1.1.0' } });
+    s.fire('objectChange', 'system.adapter.flow.0', { ...updated, common: { ...updated.common, enabled: true } });
+    check('catalog: nothing read before the burst is over', fetched, []);
+    await new Promise((r) => setTimeout(r, 2300));
+    const second = await reg.loadWebComponentCatalog();
+    check(
+        'catalog: the update read once, without a page reload, under the new version',
+        [fetched, second[0]?.moduleUrl],
+        [['http://h:8095/adapter/flow/wc/d.json?v=1.1.0'], 'http://h:8095/adapter/flow/wc/d.js?v=1.1.0'],
+    );
+    stop();
+    stop2();
+    check(
+        'catalog: still watched right after the last user left (tab switch)',
+        s.emitted.filter((e) => e[0] === 'unsubscribeObjects').length,
+        0,
+    );
+    globalThis.fetch = realFetch;
+}
+
 // ── object views: the ID of a row ───────────────────────────────────────────
 check(
     'row of the config view (keyed by name): the object ID',
@@ -603,3 +921,5 @@ if (failed) {
     process.exit(1);
 }
 console.log('\nall web component checks passed');
+// the catalog keeps watching a while after its last user left (a timer of 10 s)
+process.exit(0);

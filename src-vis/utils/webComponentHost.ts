@@ -11,6 +11,8 @@
  * - `findTabForView` - where the `iob-navigate` event of a component leads.
  * - `webComponentPickerEntries` / `parseWebComponentKey` / `webComponentGridSize` -
  *   every installed component as an entry of its own in the "add widget" dialog.
+ * - `versionedSources` / `versionedModule` / `mergeCatalog` / `createCatalogWatch` -
+ *   a catalog that follows installs and updates, with versioned URLs.
  */
 import {
     getDefaultSettings,
@@ -379,4 +381,148 @@ export function webComponentGridSize(
 export function objectIdOfRow(row: { id: string; value?: unknown }): string {
     const own = (row.value as { _id?: unknown } | null | undefined)?._id;
     return typeof own === 'string' && own ? own : row.id;
+}
+
+// ── a catalog that stays current ────────────────────────────────────────────
+
+/**
+ * A URL with the adapter version as query `v`. Manifests and modules lie under
+ * URLs without a version, so a browser could keep using cached files of an
+ * adapter after its update; with the version the next page load fetches the new
+ * ones. The servers (Aura's own, web) ignore the query.
+ *
+ * @param url absolute URL of a manifest or a module
+ * @param version version of the adapter that brings it
+ */
+export function versionedUrl(url: string, version: string): string {
+    if (!version) return url;
+    try {
+        const u = new URL(url);
+        u.searchParams.set('v', version);
+        return u.href;
+    } catch {
+        return url;
+    }
+}
+
+/**
+ * The sources of the catalog (`getWebComponentSources`) with versioned manifest URLs
+ *
+ * @param sources where the components are described
+ */
+export function versionedSources<T extends { url: string; version: string }>(sources: T[]): T[] {
+    return sources.map((s) => ({ ...s, url: versionedUrl(s.url, s.version) }));
+}
+
+/**
+ * A loaded component whose module URL is versioned as well: the manifest names its
+ * module relative to itself, and resolving that drops the query of the manifest
+ * URL. `importWebComponent` still imports every URL once and checks the tag.
+ *
+ * @param component as `loadWebComponents` gave it
+ */
+export function versionedModule(component: LoadedWebComponent): LoadedWebComponent {
+    return { ...component, moduleUrl: versionedUrl(component.moduleUrl, component.version) };
+}
+
+/**
+ * The catalog read again, merged with the one before:
+ * - a component whose element is defined already keeps the module URL it was
+ *   imported from. A browser cannot define a tag twice, so the module of an update
+ *   would be loaded and run for nothing - it takes effect with the next page load;
+ * - a component that did not change stays the same object, so the widgets showing
+ *   it are left alone.
+ *
+ * @param next the components just read
+ * @param previous the components read before
+ * @param isDefined whether the element of a tag is defined in this page
+ */
+export function mergeCatalog(
+    next: LoadedWebComponent[],
+    previous: LoadedWebComponent[],
+    isDefined: (tag: string) => boolean,
+): LoadedWebComponent[] {
+    return next.map((c) => {
+        const before = previous.find((p) => p.adapter === c.adapter && p.manifest.tag === c.manifest.tag);
+        if (!before) return c;
+        const kept =
+            before.moduleUrl !== c.moduleUrl && isDefined(c.manifest.tag) ? { ...c, moduleUrl: before.moduleUrl } : c;
+        const same =
+            kept.url === before.url &&
+            kept.moduleUrl === before.moduleUrl &&
+            JSON.stringify(kept.manifest) === JSON.stringify(before.manifest);
+        return same ? before : kept;
+    });
+}
+
+const INSTANCE_ID = /^system\.adapter\.([^.]+)\.\d+$/;
+
+/** The part of an instance object the catalog depends on */
+interface CatalogInstance {
+    _id?: unknown;
+    common?: { version?: unknown; webComponents?: unknown };
+}
+
+/**
+ * What of an instance object decides the catalog: its adapter, version and list
+ * of components. null for an instance without components and for every other ID.
+ *
+ * @param id the object ID, e.g. `system.adapter.flow.0`
+ * @param obj the object, null when it was deleted
+ */
+export function catalogEntryOf(id: unknown, obj: unknown): string | null {
+    const m = typeof id === 'string' ? INSTANCE_ID.exec(id) : null;
+    const common = (obj as CatalogInstance | null | undefined)?.common;
+    const list = common?.webComponents;
+    if (!m || !Array.isArray(list) || !list.length) return null;
+    return JSON.stringify([m[1], String(common?.version ?? ''), list]);
+}
+
+/** Tells from the instance objects whether the catalog has to be read again */
+export interface CatalogWatch {
+    /** The catalog was just read from these instance objects */
+    reset(instances: unknown[]): void;
+    /** An `objectChange` below `system.adapter.`: true when the catalog has to be read again */
+    change(id: string, obj: unknown): boolean;
+    /** The instance objects read anew after a time without changes (an outage): true when they differ */
+    differs(instances: unknown[]): boolean;
+}
+
+/**
+ * Read the catalog again only when the set of (adapter, version, components)
+ * changes - installed, updated or removed - and not when an instance starts,
+ * stops, gets new settings or an adapter gets a second instance.
+ */
+export function createCatalogWatch(): CatalogWatch {
+    let entries = new Map<string, string>();
+    let signature = '';
+    const collect = (instances: unknown[]): Map<string, string> => {
+        const map = new Map<string, string>();
+        for (const obj of instances) {
+            const id = (obj as CatalogInstance | null)?._id;
+            const entry = catalogEntryOf(id, obj);
+            if (entry) map.set(id as string, entry);
+        }
+        return map;
+    };
+    const sign = (map: Map<string, string>): string => [...new Set(map.values())].sort().join('\n');
+    return {
+        reset(instances) {
+            entries = collect(instances);
+            signature = sign(entries);
+        },
+        change(id, obj) {
+            if (!INSTANCE_ID.test(id)) return false;
+            const entry = catalogEntryOf(id, obj);
+            if (entry) entries.set(id, entry);
+            else entries.delete(id);
+            const next = sign(entries);
+            if (next === signature) return false;
+            signature = next;
+            return true;
+        },
+        differs(instances) {
+            return sign(collect(instances)) !== signature;
+        },
+    };
 }
