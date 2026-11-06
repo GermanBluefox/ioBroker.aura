@@ -16,6 +16,7 @@ import { findTabForView, themeFromVars, typedSettings } from '../../utils/webCom
 import { findWebComponent, getWebComponentSocket, useWebComponentCatalog } from '../../utils/webComponentRegistry';
 import type { WidgetProps } from '../../types';
 import { HeaderGroup, HeaderSlotsInline, HeaderSlotsRow2, TitleRow } from '../layout/HeaderSlotsContext';
+import { useWebComponentDialogs } from './WebComponentDialog';
 
 const FILL = { display: 'block', width: '100%', height: '100%' } as const;
 
@@ -24,8 +25,8 @@ type Status = 'loading' | 'ready' | 'missing' | 'failed' | 'unset';
 /**
  * Shows an ioBroker web component (`@iobroker/web-components`) of an installed
  * adapter: its custom element gets Aura's socket, the settings stored in the
- * widget, the colors and the font of the theme, and the edit mode. The element
- * subscribes and writes on its own; dialogs it opens use the browser's <dialog>.
+ * widget, the colors and the font of the theme, the edit mode and Aura's dialogs
+ * (WebComponentDialog). The element subscribes and writes on its own.
  */
 export function WebComponentWidget({ config, editMode }: WidgetProps) {
     const t = useT();
@@ -114,6 +115,9 @@ export function WebComponentWidget({ config, editMode }: WidgetProps) {
         elRef.current.theme = theme;
     }, [status, themeEpoch]);
 
+    // dialogs: in Aura's look instead of the browser's <dialog>
+    const dialog = useWebComponentDialogs(elRef, status === 'ready', editMode);
+
     // iob-navigate: show a tab of this layout, named by slug, id or name
     useEffect(() => {
         const el = elRef.current;
@@ -191,6 +195,7 @@ export function WebComponentWidget({ config, editMode }: WidgetProps) {
             >
                 {body}
             </div>
+            {dialog}
         </div>
     );
 }

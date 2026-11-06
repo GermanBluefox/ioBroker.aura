@@ -3546,6 +3546,10 @@ export const de = {
     'wc.unset': 'Keine Komponente gewählt',
     'wc.missing': 'Komponente <{tag}> ist nicht installiert',
     'wc.failed': 'Komponente <{tag}> lässt sich nicht laden: {error}',
+    'wc.noObjects': 'Keine Objekte gefunden',
+    'wc.objectNotFound': '{id} (nicht gefunden)',
+    'wc.pickDatapoint': 'Aus ioBroker wählen',
+    'wc.dialog': 'Dialog der Komponente',
 } as const;
 
 export type TranslationKey = keyof typeof de;

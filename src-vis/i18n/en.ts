@@ -3516,4 +3516,8 @@ export const en: Record<TranslationKey, string> = {
     'wc.unset': 'No component selected',
     'wc.missing': 'Component <{tag}> is not installed',
     'wc.failed': 'Component <{tag}> could not be loaded: {error}',
+    'wc.noObjects': 'No objects found',
+    'wc.objectNotFound': '{id} (not found)',
+    'wc.pickDatapoint': 'Pick from ioBroker',
+    'wc.dialog': 'Dialog of the component',
 };
