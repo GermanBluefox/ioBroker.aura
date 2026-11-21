@@ -22,3 +22,4 @@
 - fix: Status overview - mains-powered HomeMatic IP devices (plugs, switches, dimmers) whose OPERATING_VOLTAGE reads 0 V are no longer reported as weak batteries; entries already remembered for them disappear (#1000)
 - feat: Status overview - new "Detected datapoints" list in the widget editor: every found datapoint has a checkbox to hide it (stored in the existing exclusion list), and an alias and the datapoint it reads from are marked as duplicates, with one click to hide all originals or all aliases (#1002)
 - feat: Adapter - new message "help": a description of all messages for AI agents (e.g. pi-agent) and script authors, and common.supportedMessages.help
+- feat: Adapter - the standard commands of the shared catalog of ioBroker.assistant: screen.getScreens (getScreens: the dashboards), screen.show (show: a message with text, a picture or a popup view for a while) and screen.hide (hide), marked with standard in the answer of help

@@ -96,6 +96,8 @@ a single forwarded port is enough.
 
 `sendTo('aura.0', 'help', {})` answers with a description of the messages (`notify`, scenes, `staggeredWrite`, …) and the command states of Aura for AI agents (e.g. pi-agent) and script authors; the answer lists all commands with `write` (whether a command changes something).
 
+`getScreens`, `show` and `hide` are the commands `screen.getScreens`, `screen.show` and `screen.hide` of the shared catalog of ioBroker.assistant: an agent can show a text, a picture or a popup view on one dashboard or all of them, in the same way as on other screens.
+
 ---
 
 ## Bugs & Feature Requests

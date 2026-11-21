@@ -58,6 +58,7 @@ const { createSecurityApi } = require('./lib/security/apiHandler');
 const { createIconCache } = require('./lib/iconCache');
 const { createAdapterIcons, ioBrokerIconSource } = require('./lib/adapterIcons');
 const { createConfigGuard, CONFIG_KEYS } = require('./lib/configGuard');
+const { SCREEN_KINDS, clientsOf, showPayload } = require('./lib/screen');
 const { runBackendCheck: buildBackendReport, resolveTarget, listBackends } = require('./lib/backendCheck');
 const { createSceneService, SCENE_COMMANDS } = require('./lib/scenes');
 const { createSayitBridge, SAYIT_PREFIX } = require('./lib/sayitBridge');
@@ -245,6 +246,10 @@ const MESSAGE_STR_MAX = 4000;
 const MESSAGE_TITLE_MAX = 1000;
 const MESSAGE_ID_MAX = 128;
 const MESSAGE_ACTIONS_MAX = 6;
+// A picture address; a message that is not kept in the history (persist false, e.g. screen.show) may carry the
+// picture itself as a data URL: a camera snapshot or a chart of echarts.
+const MESSAGE_IMAGE_MAX = 2000;
+const MESSAGE_IMAGE_DATA_MAX = 2000000;
 const MESSAGE_TARGET_CLIENTS_MAX = 50;
 // CSS colour strings; a cap is enough, React puts them in a style object where a
 // value can only ever be a value.
@@ -3202,7 +3207,7 @@ class Aura extends utils.Adapter {
         if (body) msg.text = body;
         const html = str(src.html);
         if (html) msg.html = html;
-        const image = str(src.image, 2000);
+        const image = str(src.image, src.persist === false ? MESSAGE_IMAGE_DATA_MAX : MESSAGE_IMAGE_MAX);
         if (image) msg.image = image;
         const icon = str(src.icon, 128);
         if (icon) msg.icon = icon;
@@ -3348,6 +3353,23 @@ class Aura extends utils.Adapter {
             // value sits in the DP and re-fires on every adapter restart.
             await this.setStateAsync(sendDpId, { val: '', ack: true });
         }
+    }
+
+    /**
+     * The dashboards for the catalog commands getScreens and show: every client with its name, whether it is
+     * switched on (heartbeat) and the kinds show can put on it.
+     *
+     * @returns {Promise<{id: string, name: string, online: boolean, kinds: string[]}[]>} the clients
+     */
+    async _screenClients() {
+        const states = {
+            ...((await this.getStatesAsync('clients.*.info.name')) || {}),
+            ...((await this.getStatesAsync('clients.*.info.lastSeen')) || {}),
+        };
+        return clientsOf(states, this.namespace, Date.now(), IDLE_CLIENT_ONLINE_MS).map((c) => ({
+            ...c,
+            kinds: [...SCREEN_KINDS],
+        }));
     }
 
     /** `messages.ack` / `messages.dismiss`. Id or `*` for all. */
@@ -6739,6 +6761,42 @@ class Aura extends utils.Adapter {
                     return;
                 }
                 await this._handleMessageMark(id, msg.command === 'notifyAck' ? 'ack' : 'dismiss');
+                reply({ ok: true, id });
+                return;
+            }
+
+            // The family "screen" of the shared catalog of ioBroker.assistant (lib/screen.js): the dashboards,
+            // and notify / notifyDismiss with the parameters and answers of the catalog.
+            if (msg.command === 'getScreens') {
+                reply({ screens: await this._screenClients() });
+                return;
+            }
+
+            if (msg.command === 'show') {
+                const m = msg.message && typeof msg.message === 'object' ? msg.message : {};
+                const { payload, screens, error } = showPayload(m, await this._screenClients());
+                if (error) {
+                    reply(error);
+                    return;
+                }
+                const delivered = await this._deliverMessage(JSON.stringify(payload), { kind: 'global' });
+                if (!delivered) {
+                    reply({ error: 'nothing to show', reason: 'BAD_REQUEST' });
+                    return;
+                }
+                this._lastShowId = delivered.id;
+                reply({ ok: true, id: delivered.id, screens });
+                return;
+            }
+
+            if (msg.command === 'hide') {
+                const id = String(msg.message?.id ?? '').trim() || this._lastShowId || '';
+                if (!id) {
+                    reply({ error: 'which message? give the id that show answered', reason: 'BAD_REQUEST' });
+                    return;
+                }
+                await this._handleMessageMark(id, 'dismiss');
+                if (id === this._lastShowId) this._lastShowId = '';
                 reply({ ok: true, id });
                 return;
             }
